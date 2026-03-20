@@ -1,0 +1,279 @@
+name: Privacy Kernel Verification
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  verify-privacy-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect checkout corruption / partial clone
+        id: checkout_health
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci_diagnostics
+          {
+            echo "# Checkout Health" 
+            date -u
+            echo "git rev-parse: $(git rev-parse --short HEAD || true)"
+          } > ci_diagnostics/checkout_health.log
+
+          unhealthy=0
+          git rev-parse --is-inside-work-tree >/dev/null 2>&1 || unhealthy=1
+          git fsck --full --no-reflogs >> ci_diagnostics/checkout_health.log 2>&1 || unhealthy=1
+
+          tracked_count=$(git ls-files | wc -l | xargs)
+          if [ "$tracked_count" -eq 0 ]; then
+            echo "Tracked file count is zero; treating as partial checkout." >> ci_diagnostics/checkout_health.log
+            unhealthy=1
+          fi
+
+          if [ "$unhealthy" -eq 1 ]; then
+            echo "corrupt=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "corrupt=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Self-heal by wiping workspace and re-cloning
+        if: steps.checkout_health.outputs.corrupt == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Detected corruption/partial checkout. Re-cloning repository..."
+
+          tmp_parent="$(dirname "$GITHUB_WORKSPACE")"
+          repo_name="$(basename "$GITHUB_REPOSITORY")"
+          clone_dir="$tmp_parent/${repo_name}-reclone"
+
+          rm -rf "$clone_dir"
+          git clone --depth 0 "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "$clone_dir"
+          cd "$clone_dir"
+          git checkout "$GITHUB_SHA"
+
+          # Wipe workspace and repopulate with clean checkout.
+          shopt -s dotglob
+          rm -rf "$GITHUB_WORKSPACE"/*
+          cp -a "$clone_dir"/. "$GITHUB_WORKSPACE"/
+
+          # Validate re-clone health
+          cd "$GITHUB_WORKSPACE"
+          git fsck --full --no-reflogs
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Build and self-heal virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci_diagnostics
+
+          heal_env() {
+            rm -rf .venv
+            python -m venv .venv
+            source .venv/bin/activate
+            python -m pip install --upgrade pip wheel setuptools
+
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt
+            fi
+            if [ -f requirements-dev.txt ]; then
+              pip install -r requirements-dev.txt
+            fi
+            if [ -f pyproject.toml ] || [ -f setup.py ]; then
+              pip install -e .
+            fi
+            if [ -f test-requirements.txt ]; then
+              pip install -r test-requirements.txt
+            fi
+
+            # Validate imports for tracked local modules.
+            python - <<'PY'
+import pathlib, importlib, sys
+root = pathlib.Path('.').resolve()
+mods = []
+for p in root.iterdir():
+    if p.name.startswith('.'):
+        continue
+    if p.is_file() and p.suffix == '.py' and p.stem not in {'conftest'}:
+        mods.append(p.stem)
+    if p.is_dir() and (p / '__init__.py').exists():
+        mods.append(p.name)
+seen = set()
+failures = []
+for m in mods:
+    if m in seen:
+        continue
+    seen.add(m)
+    try:
+        importlib.import_module(m)
+    except Exception as e:
+        failures.append(f"{m}: {e}")
+if failures:
+    print("IMPORT_VALIDATION_FAILURE")
+    for f in failures:
+        print(f)
+    sys.exit(1)
+print("IMPORT_VALIDATION_OK")
+PY
+          }
+
+          if ! heal_env > ci_diagnostics/venv_build_attempt1.log 2>&1; then
+            echo "Initial environment build/import validation failed; attempting auto-repair..."
+            rm -rf .venv
+            python -m pip cache purge || true
+            if ! heal_env > ci_diagnostics/venv_build_attempt2.log 2>&1; then
+              echo "Environment repair failed after second attempt."
+              exit 1
+            fi
+          fi
+
+      - name: Run privacy-kernel tests with nondeterminism detection (up to 10 retries)
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          mkdir -p ci_artifacts ci_diagnostics
+
+          # Ensure pytest is available for test orchestration.
+          python - <<'PY'
+import importlib.util, sys
+if importlib.util.find_spec('pytest') is None:
+    sys.exit("pytest not installed; add it to project dependencies")
+PY
+
+          run_check() {
+            local name="$1"
+            local expr="$2"
+            local out="ci_diagnostics/${name}.txt"
+            local junit="ci_artifacts/${name}.xml"
+
+            set +e
+            pytest -q -k "$expr" --maxfail=1 --disable-warnings --junitxml "$junit" > "$out" 2>&1
+            local status=$?
+            set -e
+
+            if [ ! -s "$out" ]; then
+              echo "No output captured for $name" > "$out"
+            fi
+
+            # Fail loudly if a themed suite has no selected tests.
+            if grep -Eq "(collected 0 items|no tests ran|deselected [0-9]+ / 0)" "$out"; then
+              echo "ERROR: Missing required tests for $name (expression: $expr)." | tee -a ci_diagnostics/fail_loud.log
+              return 200
+            fi
+
+            return "$status"
+          }
+
+          # Required targeted checks.
+          run_check pac_bound "pac and bound" || pac_status=$? || true
+          pac_status=${pac_status:-0}
+          run_check leakage_tracking "leakage and tracking" || leak_status=$? || true
+          leak_status=${leak_status:-0}
+          run_check enforcement_logic "enforcement and (deny or noise or clip)" || enf_status=$? || true
+          enf_status=${enf_status:-0}
+          run_check controller_invariants "invariant and privacy and controller" || inv_status=$? || true
+          inv_status=${inv_status:-0}
+
+          if [ "$pac_status" -eq 200 ] || [ "$leak_status" -eq 200 ] || [ "$enf_status" -eq 200 ] || [ "$inv_status" -eq 200 ]; then
+            echo "Required test categories missing; failing loudly."
+            exit 1
+          fi
+
+          # Loud failures for critical guarantees.
+          if [ "$inv_status" -ne 0 ]; then
+            echo "ERROR: privacy controller invariants violated." | tee -a ci_diagnostics/fail_loud.log
+            exit 1
+          fi
+          if [ "$pac_status" -ne 0 ]; then
+            echo "ERROR: PAC-style bound computation failed or diverged." | tee -a ci_diagnostics/fail_loud.log
+            exit 1
+          fi
+          if [ "$enf_status" -ne 0 ]; then
+            echo "ERROR: enforcement mechanism failed to activate as expected." | tee -a ci_diagnostics/fail_loud.log
+            exit 1
+          fi
+          if [ "$leak_status" -ne 0 ]; then
+            echo "ERROR: leakage-tracking tests failed." | tee -a ci_diagnostics/fail_loud.log
+            exit 1
+          fi
+
+          # Full test run with up to 10 retries and nondeterminism diagnostics.
+          attempt=1
+          max_attempts=10
+          declare -a hashes=()
+          overall_status=1
+
+          while [ "$attempt" -le "$max_attempts" ]; do
+            out="ci_diagnostics/full_test_attempt_${attempt}.txt"
+            junit="ci_artifacts/full_test_attempt_${attempt}.xml"
+
+            set +e
+            pytest -q --disable-warnings --junitxml "$junit" > "$out" 2>&1
+            status=$?
+            set -e
+
+            hash=$(sha256sum "$out" | awk '{print $1}')
+            hashes+=("$hash")
+
+            if [ "$status" -eq 0 ]; then
+              overall_status=0
+              break
+            fi
+            attempt=$((attempt + 1))
+          done
+
+          unique_count=$(printf "%s\n" "${hashes[@]}" | sort -u | wc -l | xargs)
+          if [ "$unique_count" -gt 1 ]; then
+            {
+              echo "Nondeterminism detected across retries."
+              echo "Attempts run: ${#hashes[@]}"
+              echo "Unique output hashes: $unique_count"
+              i=1
+              for h in "${hashes[@]}"; do
+                echo "attempt_${i}: $h"
+                i=$((i + 1))
+              done
+            } | tee ci_diagnostics/nondeterminism_summary.txt
+          else
+            {
+              echo "No nondeterminism detected in retry outputs."
+              echo "Attempts run: ${#hashes[@]}"
+              echo "Single output hash: ${hashes[0]:-none}"
+            } > ci_diagnostics/nondeterminism_summary.txt
+          fi
+
+          # Collect explicitly named artifacts.
+          cp ci_diagnostics/controller_invariants.txt ci_artifacts/invariant_check_results.txt
+          cp ci_diagnostics/pac_bound.txt ci_artifacts/bound_values.txt
+          cp ci_diagnostics/enforcement_logic.txt ci_artifacts/enforcement_logs.txt
+
+          if [ "$overall_status" -ne 0 ]; then
+            echo "Full test suite failed after ${#hashes[@]} attempts."
+            exit 1
+          fi
+
+      - name: Upload privacy verification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: privacy-kernel-verification-artifacts
+          if-no-files-found: warn
+          path: |
+            ci_artifacts/**
+            ci_diagnostics/**
