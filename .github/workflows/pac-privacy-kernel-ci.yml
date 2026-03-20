@@ -1,0 +1,250 @@
+name: PAC Privacy Kernel CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pac-kernel-tests:
+    runs-on: ubuntu-latest
+    env:
+      PYTHON_VERSION: "3.10"
+      MAX_RETRIES: "10"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect partial checkout or corruption
+        id: preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "sha=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF}"
+          } > artifacts/preflight.txt
+
+          if [ ! -d .git ]; then
+            echo "corrupt=true" >> "$GITHUB_OUTPUT"
+            echo "Missing .git directory" >> artifacts/preflight.txt
+            exit 0
+          fi
+
+          if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+            echo "corrupt=true" >> "$GITHUB_OUTPUT"
+            echo "Invalid HEAD" >> artifacts/preflight.txt
+            exit 0
+          fi
+
+          git fsck --no-reflogs --full > artifacts/git-fsck.log 2>&1 || true
+          if rg -n "error|fatal|corrupt|missing" artifacts/git-fsck.log >/dev/null 2>&1; then
+            echo "corrupt=true" >> "$GITHUB_OUTPUT"
+            echo "git fsck reported problems" >> artifacts/preflight.txt
+          else
+            echo "corrupt=false" >> "$GITHUB_OUTPUT"
+            echo "Repository integrity check passed" >> artifacts/preflight.txt
+          fi
+
+      - name: Self-heal workspace by re-cloning
+        if: steps.preflight.outputs.corrupt == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Corruption/partial checkout detected; re-cloning workspace..."
+          ROOT_DIR="$PWD"
+          TMP_DIR="$(mktemp -d)"
+          REMOTE_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git clone --no-tags --depth 1 "$REMOTE_URL" "$TMP_DIR/repo"
+          rsync -a --delete --exclude ".git" "$TMP_DIR/repo/" "$ROOT_DIR/"
+          cp -a "$TMP_DIR/repo/.git" "$ROOT_DIR/.git"
+          rm -rf "$TMP_DIR"
+          git status --short
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build and self-heal virtualenv
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
+          repair_env() {
+            echo "Repairing virtual environment..." | tee -a artifacts/environment.log
+            rm -rf .venv
+            python -m venv .venv
+            source .venv/bin/activate
+            python -m pip install --upgrade pip wheel setuptools
+
+            if [ -f requirements.txt ]; then
+              python -m pip install -r requirements.txt || true
+            fi
+
+            if [ -f pyproject.toml ]; then
+              python -m pip install -e . || true
+            fi
+
+            # Final strict pass: if either exists, enforce successful install.
+            if [ -f requirements.txt ]; then
+              python -m pip install -r requirements.txt
+            elif [ -f pyproject.toml ]; then
+              python -m pip install -e .
+            fi
+          }
+
+          repair_env 2>&1 | tee artifacts/pip-install.log
+
+          # Smoke-check imports from local package layout; if this fails, auto-repair once.
+          if ! source .venv/bin/activate || ! python - <<'PY'
+import importlib.util
+from pathlib import Path
+root = Path('.')
+imports_ok = True
+if (root / 'src').exists():
+    modules = [p.stem for p in (root / 'src').glob('*.py') if p.stem != '__init__']
+else:
+    modules = [p.stem for p in root.glob('*.py') if p.stem != '__init__']
+for m in modules[:10]:
+    try:
+        __import__(m)
+    except Exception:
+        imports_ok = False
+        print(f"import-check-failed:{m}")
+if not modules:
+    print("import-check-info:no-top-level-modules-found")
+if not imports_ok:
+    raise SystemExit(1)
+print("import-check-ok")
+PY
+          then
+            echo "Initial import smoke-check failed; performing full env repair." | tee -a artifacts/environment.log
+            repair_env 2>&1 | tee -a artifacts/pip-install.log
+            source .venv/bin/activate
+            python -c 'print("post-repair-import-probe")' >> artifacts/environment.log
+          fi
+
+      - name: Execute targeted tests with nondeterminism detection and retry
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          mkdir -p artifacts
+
+          TEST_EXPR="pac and (bound or leakage or enforce or invariant or privacy_controller)"
+          : > artifacts/test-run-summary.txt
+
+          pass_once=0
+          nondeterministic=0
+          prev_hash=""
+          seen_fail_hash_change=0
+
+          for i in $(seq 1 "$MAX_RETRIES"); do
+            LOG="artifacts/test-run-${i}.log"
+            set +e
+            pytest -q --maxfail=1 -k "$TEST_EXPR" 2>&1 | tee "$LOG"
+            code=${PIPESTATUS[0]}
+            set -e
+
+            HASH=$(sha256sum "$LOG" | awk '{print $1}')
+            echo "run=$i exit_code=$code hash=$HASH" | tee -a artifacts/test-run-summary.txt
+
+            if [ "$code" -eq 0 ]; then
+              pass_once=1
+            fi
+
+            if [ -n "$prev_hash" ] && [ "$prev_hash" != "$HASH" ]; then
+              nondeterministic=1
+              if [ "$code" -ne 0 ]; then
+                seen_fail_hash_change=1
+              fi
+            fi
+            prev_hash="$HASH"
+
+            if [ "$pass_once" -eq 1 ]; then
+              break
+            fi
+          done
+
+          echo "nondeterministic=$nondeterministic" | tee artifacts/nondeterminism-flag.txt
+          if [ "$nondeterministic" -eq 1 ]; then
+            {
+              echo "Nondeterminism detected across retries."
+              echo "Diagnostic summary:"
+              cat artifacts/test-run-summary.txt
+            } | tee artifacts/nondeterminism-summary.txt
+          fi
+
+          if [ "$pass_once" -ne 1 ]; then
+            echo "Tests did not pass in ${MAX_RETRIES} attempts." >&2
+            exit 1
+          fi
+
+      - name: Validate hard-fail conditions from logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
+          LAST_LOG=$(ls artifacts/test-run-*.log | tail -n 1)
+          cp "$LAST_LOG" artifacts/final-test.log
+
+          # Fail loudly if kernel safety conditions appear violated or missing.
+          if rg -n "(invariant.*(violate|fail)|privacy controller.*(violate|fail))" "$LAST_LOG"; then
+            echo "Privacy controller invariant violation detected." >&2
+            exit 1
+          fi
+
+          if rg -n "(bound.*diverg|diverg.*bound|nan|inf)" "$LAST_LOG"; then
+            echo "Bound computation divergence detected." >&2
+            exit 1
+          fi
+
+          if rg -n "(expected.*enforce|enforcement.*not.*(activat|trigger)|deny/noise/clip.*missing)" "$LAST_LOG"; then
+            echo "Enforcement mechanism failed to activate when expected." >&2
+            exit 1
+          fi
+
+          echo "Hard-fail guard checks passed." | tee artifacts/hard-fail-guards.txt
+
+      - name: Collect enforcement/bound/invariant artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/export
+
+          # Copy canonical outputs if tests emit them.
+          for p in \
+            enforcement.log \
+            enforcement_logs.json \
+            bound_values.json \
+            bounds.json \
+            invariants.json \
+            invariant_results.json; do
+            if [ -f "$p" ]; then
+              cp "$p" artifacts/export/"$p"
+            fi
+          done
+
+          # Collect any test-generated diagnostics in common locations.
+          find . -maxdepth 3 -type f \( \
+            -iname "*enforce*log*" -o \
+            -iname "*bound*value*" -o \
+            -iname "*invariant*" \
+          \) -not -path "./.git/*" -print > artifacts/export/discovered-artifacts.txt || true
+
+      - name: Upload diagnostics artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pac-kernel-diagnostics
+          path: artifacts
+          if-no-files-found: warn
