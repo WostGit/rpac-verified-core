@@ -1,0 +1,260 @@
+name: Privacy Kernel Verification
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify-privacy-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify checkout integrity
+        id: checkout_health
+        shell: bash
+        run: |
+          set -euo pipefail
+          corrupted=0
+
+          if [ ! -d .git ] || [ ! -f .git/HEAD ]; then
+            echo "::error::Missing .git metadata (possible partial checkout)."
+            corrupted=1
+          fi
+
+          if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+            echo "::error::Cannot resolve HEAD (possible checkout corruption)."
+            corrupted=1
+          fi
+
+          if ! git fsck --no-reflogs --strict >/tmp/git-fsck.log 2>&1; then
+            echo "::error::git fsck failed."
+            cat /tmp/git-fsck.log
+            corrupted=1
+          fi
+
+          if [ "$corrupted" -eq 1 ]; then
+            echo "corrupted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "corrupted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Self-heal corrupted checkout
+        if: steps.checkout_health.outputs.corrupted == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_url="${{ github.server_url }}/${{ github.repository }}.git"
+          branch="${{ github.ref_name }}"
+          temp_dir="$(mktemp -d)"
+
+          echo "Detected corruption. Wiping workspace and re-cloning ${repo_url} (${branch})."
+          find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+
+          git clone --depth 1 --branch "$branch" "$repo_url" "$temp_dir/repo"
+          shopt -s dotglob
+          mv "$temp_dir/repo"/* "$GITHUB_WORKSPACE"/
+          rm -rf "$temp_dir"
+
+          git rev-parse --verify HEAD >/dev/null
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Build and self-heal virtual environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          create_env() {
+            rm -rf .venv
+            python -m venv .venv
+            . .venv/bin/activate
+            python -m pip install --upgrade pip setuptools wheel
+          }
+
+          install_deps() {
+            local status=0
+            if [ -f requirements.txt ]; then
+              python -m pip install -r requirements.txt || status=1
+            fi
+            if [ -f requirements-dev.txt ]; then
+              python -m pip install -r requirements-dev.txt || status=1
+            fi
+            if [ "$status" -ne 0 ]; then
+              return 1
+            fi
+            python -m pip install pytest
+          }
+
+          import_sanity() {
+            python - <<'PY'
+import importlib
+import pathlib
+import sys
+
+import pytest  # noqa: F401
+
+root = pathlib.Path('.')
+packages = sorted({
+    p.parent.name
+    for p in root.rglob('__init__.py')
+    if '.venv' not in p.parts and '.git' not in p.parts
+})
+for name in packages[:10]:
+    importlib.import_module(name)
+print(f"import_sanity_ok packages={len(packages)}")
+PY
+          }
+
+          repaired=0
+          for attempt in 1 2 3; do
+            echo "Venv setup attempt ${attempt}"
+            create_env
+            if install_deps && import_sanity; then
+              echo "Virtual environment healthy."
+              repaired=1
+              break
+            fi
+            echo "Environment failed health checks; performing repair cycle."
+          done
+
+          if [ "$repaired" -ne 1 ]; then
+            echo "::error::Virtual environment could not be repaired after 3 attempts."
+            exit 1
+          fi
+
+      - name: Validate expected privacy test coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+          mkdir -p .ci-artifacts
+
+          if [ ! -d tests ]; then
+            echo "::error::tests/ directory is missing; cannot verify privacy kernel behavior."
+            exit 1
+          fi
+
+          pytest --collect-only -q > .ci-artifacts/collected-tests.txt
+
+          require_pattern() {
+            local pattern="$1"
+            local description="$2"
+            if ! grep -Ei "$pattern" .ci-artifacts/collected-tests.txt >/dev/null; then
+              echo "::error::Missing tests for ${description}."
+              exit 1
+            fi
+          }
+
+          require_pattern 'pac|bound' 'PAC-style bound computation'
+          require_pattern 'leak|leakage' 'leakage tracking'
+          require_pattern 'enforc|deny|noise|clip' 'enforcement logic (deny/noise/clip)'
+          require_pattern 'invariant|privacy[_-]?controller' 'privacy controller invariants'
+
+      - name: Run tests with nondeterminism detection and retries
+        shell: bash
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+          mkdir -p .ci-artifacts
+
+          nondet=0
+          final_status=1
+          attempt=1
+          summary_file=".ci-artifacts/nondeterminism-summary.txt"
+          : > "$summary_file"
+
+          prev_hash=""
+          prev_status=""
+
+          while [ "$attempt" -le 10 ]; do
+            log_file=".ci-artifacts/test-run-${attempt}.log"
+            echo "=== test attempt ${attempt} ==="
+            set +e
+            pytest -q --maxfail=0 2>&1 | tee "$log_file"
+            status=${PIPESTATUS[0]}
+            set -e
+
+            hash=$(sha256sum "$log_file" | awk '{print $1}')
+            printf 'attempt=%s status=%s hash=%s\n' "$attempt" "$status" "$hash" | tee -a "$summary_file"
+
+            if [ "$attempt" -gt 1 ]; then
+              if [ "$hash" != "$prev_hash" ] || [ "$status" != "$prev_status" ]; then
+                nondet=1
+              fi
+            fi
+
+            if [ "$status" -eq 0 ] && [ "$nondet" -eq 0 ]; then
+              final_status=0
+              break
+            fi
+
+            final_status=$status
+            prev_hash="$hash"
+            prev_status="$status"
+            attempt=$((attempt + 1))
+          done
+
+          if [ "$nondet" -eq 1 ]; then
+            echo "Nondeterminism detected across retries. Diagnostic summary:"
+            cat "$summary_file"
+          fi
+
+          # Fail loudly on critical privacy-kernel failures.
+          all_logs=".ci-artifacts/all-test-output.log"
+          cat .ci-artifacts/test-run-*.log > "$all_logs"
+
+          if grep -Eiq 'invariant.*(fail|violat)|privacy controller.*(fail|violat)' "$all_logs"; then
+            echo "::error::Privacy controller invariants were violated."
+            exit 1
+          fi
+
+          if grep -Eiq 'bound.*(diverg|nan|inf|overflow)' "$all_logs"; then
+            echo "::error::Bound computation diverged."
+            exit 1
+          fi
+
+          if grep -Eiq 'enforc.*(not activate|inactive|missing)|expected.*(deny|noise|clip).*not' "$all_logs"; then
+            echo "::error::Enforcement mechanism did not activate when expected."
+            exit 1
+          fi
+
+          exit "$final_status"
+
+      - name: Package verification artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ci-artifacts
+
+          all_logs=".ci-artifacts/all-test-output.log"
+          if [ -f "$all_logs" ]; then
+            grep -Eio 'bound[^\n]*' "$all_logs" > .ci-artifacts/bound-values.txt || true
+            grep -Eio '(enforce|deny|noise|clip)[^\n]*' "$all_logs" > .ci-artifacts/enforcement-logs.txt || true
+            grep -Eio 'invariant[^\n]*' "$all_logs" > .ci-artifacts/invariant-results.txt || true
+          fi
+
+          for f in bound-values.txt enforcement-logs.txt invariant-results.txt; do
+            if [ ! -s ".ci-artifacts/$f" ]; then
+              echo "No entries extracted for $f" > ".ci-artifacts/$f"
+            fi
+          done
+
+      - name: Upload privacy kernel artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: privacy-kernel-verification-artifacts
+          path: .ci-artifacts/
+          if-no-files-found: error
